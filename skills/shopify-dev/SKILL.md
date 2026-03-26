@@ -1,39 +1,36 @@
 ---
-description: "Use when building, configuring, deploying, or debugging Shopify apps. Covers React Router v7 architecture, GraphQL Admin API, authentication, webhooks, billing, Shopify Flow, compliance, CLI commands, and App Store launch. Trigger when code imports @shopify/*, uses shopify CLI, or user mentions Shopify app development."
+name: shopify-dev
+description: Comprehensive Shopify app development guide covering React Router v7, GraphQL Admin API, authentication, webhooks, billing, compliance, Flow integration, and app store launch. Use when building, debugging, or deploying Shopify apps.
 ---
 
 # Shopify App Development Skill
 
 ## Quick Reference
 
-**Framework:** React Router v7 (NOT Remix) via `@shopify/shopify-app-react-router`
-**API:** GraphQL Admin API only (REST is legacy since Oct 2024)
-**Auth:** Token Exchange + Session Tokens (for embedded apps)
-**CLI:** `@shopify/cli` (v3.90+) - install globally: `npm install -g @shopify/cli`
-**App Bridge:** CDN script tag (auto-updates, no npm package)
-**API Version:** Use latest stable (currently `2026-01`)
+- Framework: React Router v7 (NOT Remix) via `@shopify/shopify-app-react-router`
+- API: GraphQL Admin API only (REST is legacy since Oct 2024)
+- Auth: Token Exchange + Session Tokens (embedded apps)
+- CLI: `@shopify/cli` (v3.90+) - `npm install -g @shopify/cli`
+- App Bridge: CDN script tag (auto-updates, no npm package needed)
+- API Version: Use latest stable (currently `2026-01`)
 
-## Architecture Overview
+## Architecture
 
 Shopify apps use a hybrid model:
-- **Your server** hosts the app's pages and backend (React Router v7)
-- **Shopify** hosts app extensions (rendered natively in admin/checkout/etc.)
-- **Embedded apps** run inside the Shopify admin iframe via App Bridge
+- Your server hosts app pages and backend logic (React Router v7)
+- Shopify hosts app extensions (rendered natively in admin/checkout/POS)
+- Embedded apps run inside the Shopify admin iframe via App Bridge
 
 ## Project Setup
 
 ```bash
-# Scaffold new app (uses React Router v7 template)
-shopify app init
-
-# Start development (creates tunnel, registers webhooks)
-shopify app dev
-
-# Deploy config + extensions to production
-shopify app deploy
-
-# Generate extension
-shopify app generate extension
+shopify app init                  # Scaffold new app (React Router v7 template)
+shopify app dev                   # Dev server + tunnel + webhook registration
+shopify app deploy                # Deploy config + extensions to production
+shopify app generate extension    # Generate a new extension
+shopify app config link           # Link to existing app
+shopify app webhook trigger       # Test a webhook locally
+shopify app info                  # Show app details
 ```
 
 ## Project Structure
@@ -41,31 +38,32 @@ shopify app generate extension
 ```
 app/
   routes/
-    app.tsx              # Layout route (auth wrapper for all app.* routes)
+    app.tsx              # Layout route - auth wrapper for all app.* routes
     app._index.tsx       # Main dashboard (authenticated)
     app.settings.tsx     # Settings page (authenticated)
-    webhooks.tsx         # Webhook handler (no auth wrapper needed)
-  shopify.server.ts      # Core Shopify config (exports authenticate, etc.)
+    webhooks.tsx         # Webhook handler (no auth wrapper)
+  shopify.server.ts      # Core config - exports authenticate, sessionStorage, etc.
   root.tsx               # Root route
 extensions/              # Shopify-hosted extensions
   my-extension/
     shopify.extension.toml
     src/index.tsx
-shopify.app.toml         # App config (scopes, webhooks, auth)
+shopify.app.toml         # App config (scopes, webhooks, auth, billing)
 shopify.web.toml         # Web process config
-vite.config.ts
-prisma/schema.prisma     # Session storage (replace SQLite in production)
+vite.config.ts           # Vite configuration
+prisma/schema.prisma     # Session storage schema (replace SQLite in production)
 ```
 
-Routes with `app.` prefix inherit authentication, error boundaries, and embedded app headers.
+Routes prefixed with `app.` inherit authentication, error boundaries, and embedded app headers from `app.tsx`.
 
-## Authentication Pattern
+## Authentication
 
-Use Token Exchange (recommended for embedded apps):
+Use Token Exchange (recommended for all embedded apps):
 
 ```typescript
 // app/shopify.server.ts
-import { shopifyApp } from "@shopify/shopify-app-react-router/server";
+import "@shopify/shopify-app-react-router/adapters/node";
+import { ApiVersion, AppDistribution, shopifyApp } from "@shopify/shopify-app-react-router/server";
 import { PrismaSessionStorage } from "@shopify/shopify-app-session-storage-prisma";
 
 const shopify = shopifyApp({
@@ -73,9 +71,9 @@ const shopify = shopifyApp({
   apiSecretKey: process.env.SHOPIFY_API_SECRET!,
   appUrl: process.env.SHOPIFY_APP_URL!,
   scopes: process.env.SCOPES?.split(","),
-  apiVersion: "2026-01",
+  apiVersion: ApiVersion.January26,
   sessionStorage: new PrismaSessionStorage(prisma),
-  distribution: "app_store",
+  distribution: AppDistribution.AppStore,
   useOnlineTokens: true,
   hooks: {
     afterAuth: async ({ session }) => {
@@ -88,27 +86,32 @@ export default shopify;
 export const authenticate = shopify.authenticate;
 ```
 
-**In routes** - always authenticate in loaders and actions:
+In routes - always call authenticate in loaders and actions:
 
 ```typescript
+import type { LoaderFunctionArgs, ActionFunctionArgs } from "react-router";
+import { useLoaderData, useFetcher } from "react-router";
+import { authenticate } from "../shopify.server";
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const response = await admin.graphql(`query { shop { name } }`);
-  const { data } = await response.json();
-  return json({ shop: data.data.shop });
+  const data = await response.json();
+  return { shopName: data.data.shop.name };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin, redirect } = await authenticate.admin(request);
-  // Use redirect from authenticate (NOT react-router redirect) for embedded apps
+  // IMPORTANT: Use redirect from authenticate, NOT react-router redirect
   return redirect("/app");
 };
 ```
 
 ## GraphQL API Usage
 
+Server-side (in loaders/actions):
+
 ```typescript
-// Server-side (in loaders/actions)
 const { admin } = await authenticate.admin(request);
 const response = await admin.graphql(
   `query GetProducts($first: Int!) {
@@ -119,22 +122,26 @@ const response = await admin.graphql(
   }`,
   { variables: { first: 10 } }
 );
+const { data } = await response.json();
+```
 
-// Frontend direct API access (requires embedded_app_direct_api_access = true)
+Frontend direct API access (requires `embedded_app_direct_api_access = true` in TOML):
+
+```typescript
 const response = await fetch("shopify:admin/api/graphql.json", {
   method: "POST",
   body: JSON.stringify({ query: `query { shop { name } }` }),
 });
 ```
 
-**Global IDs:** Format `gid://shopify/{Type}/{ID}` (e.g., `gid://shopify/Product/123`)
+Global IDs use format `gid://shopify/{Type}/{ID}` (e.g., `gid://shopify/Product/123`).
 
-For complete API reference, rate limits, pagination, and bulk operations, read:
-- [references/build-reference.md](references/build-reference.md)
+For rate limits, pagination, bulk operations, cost calculation, and key mutations:
+- [references/graphql-patterns.md](references/graphql-patterns.md)
 
 ## Webhooks
 
-Configure declaratively in `shopify.app.toml` (recommended):
+Configure declaratively in `shopify.app.toml`:
 
 ```toml
 [webhooks]
@@ -149,7 +156,7 @@ compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"
 uri = "/webhooks"
 ```
 
-Handle in route:
+Handle in a route:
 
 ```typescript
 // app/routes/webhooks.tsx
@@ -162,12 +169,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     case "CUSTOMERS_DATA_REQUEST":
     case "CUSTOMERS_REDACT":
     case "SHOP_REDACT":
-      // Handle GDPR - MANDATORY for App Store
+      // Handle GDPR compliance - MANDATORY for App Store
       break;
   }
   return new Response();
 };
 ```
+
+For webhook verification, retry handling, GDPR details:
+- [references/webhooks-compliance.md](references/webhooks-compliance.md)
 
 ## Billing
 
@@ -204,6 +214,9 @@ if (!hasActivePayment) {
 }
 ```
 
+For usage billing, managed pricing, GraphQL billing mutations:
+- [references/billing-reference.md](references/billing-reference.md)
+
 ## shopify.app.toml Configuration
 
 ```toml
@@ -213,7 +226,7 @@ application_url = "https://myapp.example.com"
 embedded = true
 
 [access_scopes]
-scopes = "read_products,read_orders,read_customers,read_analytics"
+scopes = "read_products,read_orders,read_customers"
 
 [access.admin]
 direct_api_mode = "online"
@@ -234,60 +247,55 @@ compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"
 uri = "/webhooks"
 ```
 
+For the complete TOML field reference:
+- [references/shopify-app-toml.md](references/shopify-app-toml.md)
+
 ## Shopify Flow Integration
 
-For Flow triggers, actions, and templates, read:
+For Flow triggers, actions, templates, and TOML configuration:
 - [references/flow-reference.md](references/flow-reference.md)
 
-## App Store Launch Checklist
+## App Store Launch
 
-For complete launch requirements, review process, and common rejection reasons, read:
-- [references/launch-reference.md](references/launch-reference.md)
+For complete submission checklist, Built for Shopify requirements, and common rejection reasons:
+- [references/launch-checklist.md](references/launch-checklist.md)
 
-**Critical requirements (will cause rejection if missed):**
-- [ ] GraphQL Admin API only (no REST)
-- [ ] Latest App Bridge (CDN script tag)
-- [ ] Embedded in Shopify Admin
-- [ ] Session token auth (no third-party cookies)
-- [ ] 3 mandatory GDPR compliance webhooks implemented
-- [ ] Billing API for all paid features (no external payment)
-- [ ] Privacy policy linked
-- [ ] OAuth initiates immediately on install
-- [ ] TLS/SSL on all endpoints
-- [ ] English demo screencast with subtitles
+Critical requirements (rejection if missed):
+- GraphQL Admin API only (no REST)
+- Latest App Bridge (CDN script tag, no npm)
+- Embedded in Shopify Admin
+- Session token auth (no third-party cookies)
+- 3 mandatory GDPR compliance webhooks implemented
+- Billing API for all paid features (no external payment)
+- Privacy policy linked
+- OAuth initiates immediately on install
+- TLS/SSL on all endpoints
 
-## Common Mistakes to Avoid
+## Common Mistakes
 
-1. **Using REST API** - Legacy since Oct 2024. Always GraphQL.
-2. **Using react-router `redirect`** - Use `authenticate.admin`'s redirect for embedded apps.
-3. **Using `<a>` tags** - Breaks embedded nav. Use React Router `Link` or Polaris `Link`.
-4. **Not deduplicating webhooks** - Check `X-Shopify-Event-Id`.
-5. **Online tokens for bulk operations** - Use offline tokens (bulk ops can exceed 24hr).
-6. **Ignoring 64KB extension size limit** - UI extensions are strictly limited.
-7. **Changing `handle` in shopify.app.toml** - Breaks embedded app admin links.
-8. **Not implementing compliance webhooks** - Instant App Store rejection.
-9. **Not calling `addDocumentResponseHeaders()`** - CSP headers required for embedded.
-10. **Using pagination args in bulk operations** - `first`/`last`/`after`/`before` are ignored.
+1. Using REST API - Legacy since Oct 2024. Use GraphQL exclusively.
+2. Using react-router `redirect` - Use `authenticate.admin`'s redirect for embedded apps.
+3. Using `<a>` tags for navigation - Breaks embedded nav. Use React Router `Link` or Polaris `Link`.
+4. Not deduplicating webhooks - Always check `X-Shopify-Event-Id` header.
+5. Online tokens for bulk operations - Use offline tokens (bulk ops can exceed 24hr).
+6. Ignoring 64KB extension size limit - UI extensions are strictly limited.
+7. Changing `handle` in shopify.app.toml after deployment - Breaks embedded admin links.
+8. Not implementing compliance webhooks - Instant App Store rejection.
+9. Not calling `addDocumentResponseHeaders()` - CSP headers required for embedded apps.
+10. Using pagination args in bulk operations - `first`/`last`/`after`/`before` are ignored.
+11. Hardcoding shop domain - Always get it from session or authenticate context.
+12. Not handling AppSubscriptionCreate user cancellation - Check for null confirmation URL.
+13. Storing sensitive data in metafields - Metafields are publicly readable via Storefront API.
+14. Not testing with different Shopify plans - Feature availability varies by merchant plan.
+15. Skipping idempotency on mutations - Use `idempotencyKey` on financial mutations.
 
 ## Rate Limits Quick Reference
 
-| Plan | Restore Rate | Bucket |
-|------|-------------|--------|
-| Standard | 100 pts/sec | 1,000 |
-| Advanced | 200 pts/sec | - |
-| Plus | 1,000 pts/sec | - |
+| Plan     | Restore Rate | Bucket |
+|----------|-------------|--------|
+| Standard | 100 pts/sec | 1,000  |
+| Advanced | 200 pts/sec | -      |
+| Plus     | 1,000 pts/sec | -    |
 
-Single query max: 1,000 points. Use `Shopify-GraphQL-Cost-Debug: 1` header.
-For large datasets, use Bulk Operations (bypasses rate limits).
-
-## CLI Commands
-
-```bash
-shopify app init              # New app
-shopify app dev               # Dev server + tunnel
-shopify app deploy            # Deploy to production
-shopify app generate extension # New extension
-shopify app config link       # Link existing app
-shopify app webhook trigger   # Test webhook
-shopify app info              # App info
-```
+Single query max: 1,000 points. Use `Shopify-GraphQL-Cost-Debug: 1` header to inspect costs.
+For large datasets, use Bulk Operations (bypasses rate limits entirely).
